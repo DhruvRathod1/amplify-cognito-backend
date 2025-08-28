@@ -1,0 +1,17 @@
+version: 1
+backend:
+  phases:
+    preBuild:
+      commands:
+        - npm install -g aws-sam-cli
+        - cd auth
+        - npm install
+        - cd ..
+    build:
+      commands:
+        - sam build
+        - sam deploy --no-confirm-changeset --no-fail-on-empty-changeset --stack-name amplify-auth-backend --s3-bucket ${DEPLOYMENT_BUCKET_NAME} --capabilities CAPABILITY_IAM --parameter-overrides Stage=dev GoogleClientId=${GOOGLE_CLIENT_ID} GoogleClientSecret=${GOOGLE_CLIENT_SECRET} AllowedOrigins=${ALLOWED_ORIGINS} FrontendUrl=${FRONTEND_URL}
+  artifacts:
+    baseDirectory: .aws-sam/build
+    files:
+      - '**/*'
