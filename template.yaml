@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Amplify Auth Backend with Cognito and Google OAuth'
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    Description: Deployment stage (e.g., dev, prod)
+  
+  GoogleClientId:
+    Type: String
+    Description: Google OAuth Client ID
+  
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Google OAuth Client Secret
+  
+  AllowedOrigins:
+    Type: String
+    Default: '*'
+    Description: Comma-separated list of allowed CORS origins
+  
+  FrontendUrl:
+    Type: String
+    Default: 'http://localhost:3000'
+    Description: Frontend URL for redirects
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-user-pool-${Stage}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+
+  # Google Identity Provider - must be created before the client
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: email profile openid
+      AttributeMapping:
+        email: email
+        name: name
+        picture: picture
+
+  # User Pool Client (App Client) - now depends on GoogleIdentityProvider
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GoogleIdentityProvider
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-app-client-${Stage}'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+      CallbackURLs:
+        - !Ref FrontendUrl
+        # Using a hardcoded URL to avoid circular dependency
+        - !Sub "https://rx1mj85lei.execute-api.${AWS::Region}.amazonaws.com/${Stage}/auth/google/callback"
+      LogoutURLs:
+        - !Ref FrontendUrl
+      SupportedIdentityProviders:
+        - COGNITO
+        - Google
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+
+  # Identity Pool for Federated Auth
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    DependsOn: UserPoolClient
+    Properties:
+      IdentityPoolName: !Sub '${AWS::StackName}-identity-pool-${Stage}'
+      AllowUnauthenticatedIdentities: true
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+          ServerSideTokenCheck: false
+
+  # IAM Role for authenticated users
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  # IAM Role for unauthenticated users
+  UnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  # Attachment of roles to identity pool
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    DependsOn:
+      - IdentityPool
+      - AuthenticatedRole
+      - UnauthenticatedRole
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+        unauthenticated: !GetAtt UnauthenticatedRole.Arn
+
+  # API Gateway for Auth Endpoints
+  AuthApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      Cors:
+        AllowMethods: "'GET, POST, PUT, DELETE, OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Access-Control-Allow-Origin'"
+        AllowOrigin: "'http://localhost:3000'"
+        MaxAge: "'600'"
+        AllowCredentials: true
+
+  # Auth Lambda Function
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - UserPoolClient
+    Properties:
+      CodeUri: ./auth/
+      Handler: app.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+          REGION: !Ref AWS::Region
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          GOOGLE_CLIENT_SECRET: !Ref GoogleClientSecret
+          STAGE: !Ref Stage
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          FRONTEND_URL: !Ref FrontendUrl
+          IDENTITY_POOL_ID: !Ref IdentityPool
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:*
+                - cognito-identity:*
+              Resource: '*'
+      Events:
+        ProxyResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AuthApiGateway
+            Path: /auth/{proxy+}
+            Method: ANY
+        RootResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AuthApiGateway
+            Path: /auth
+            Method: ANY
+
+Outputs:
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"
+
+  IdentityPoolId:
+    Description: ID of the Cognito Identity Pool
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub "${AWS::StackName}-IdentityPoolId"
+
+  AuthApiEndpoint:
+    Description: URL of the API Gateway endpoint
+    Value: !Sub "https://${AuthApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: !Sub "${AWS::StackName}-AuthApiEndpoint"
