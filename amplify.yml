@@ -1,4 +1,16 @@
 version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - echo "No frontend build required"
+    build:
+      commands:
+        - echo "Backend-only project - no frontend to build"
+  artifacts:
+    baseDirectory: /
+    files:
+      - '**/*.html'
 backend:
   phases:
     preBuild:
